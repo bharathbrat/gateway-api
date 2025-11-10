@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-api-crd-installer-script
+  namespace: default
+data:
+  install.sh: |
+    #!/bin/sh
+    set -e
+
+    # --- Configuration Validation ---
+    if [ -z "$GATEWAY_API_VERSION" ]; then
+      echo "Error: GATEWAY_API_VERSION environment variable is not set."
+      exit 1
+    fi
+    if [ -z "$RELEASE_CHANNEL" ]; then
+      echo "Error: RELEASE_CHANNEL environment variable is not set. Must be 'standard' or 'experimental'."
+      exit 1
+    fi
+
+    echo "Starting Gateway API CRD Installer"
+    echo "Target Version: $GATEWAY_API_VERSION"
+    echo "Target Channel: $RELEASE_CHANNEL"
+
+    # --- Default CRD Lists (v1.x+) ---
+    # These lists act as defaults if CRD_SUBSET is not provided.
+    # They are based on typical contents of standard/experimental channels.
+    STD_CRDS="gatewayclasses.gateway.networking.k8s.io gateways.gateway.networking.k8s.io httproutes.gateway.networking.k8s.io grpcroutes.gateway.networking.k8s.io referencegrants.gateway.networking.k8s.io"
+    EXP_CRDS="$STD_CRDS tlsroutes.gateway.networking.k8s.io tcproutes.gateway.networking.k8s.io udproutes.gateway.networking.k8s.io backendtlspolicies.gateway.networking.k8s.io"
+
+    # Determine which CRDs to operate on
+    if [ -n "$CRD_SUBSET" ]; then
+      echo "Using user-provided subset of CRDs: $CRD_SUBSET"
+      # Replace commas with spaces for standard shell iteration
+      TARGET_CRDS=$(echo "$CRD_SUBSET" | tr ',' ' ')
+    else
+      if [ "$RELEASE_CHANNEL" = "experimental" ]; then
+         TARGET_CRDS="$EXP_CRDS"
+      else
+         TARGET_CRDS="$STD_CRDS"
+      fi
+    fi
+
+    # Function for SemVer comparison using sort -V
+    # Returns 0 if $1 < $2, 1 otherwise.
+    version_lt() {
+        [ "$1" = "$2" ] && return 1
+        [  "$1" = "`echo -e "$1\n$2" | sort -V | head -n1`" ]
+    }
+
+    # --- Main Installation Loop ---
+    for CRD in $TARGET_CRDS; do
+      echo "------------------------------------------------"
+      echo "Processing CRD: $CRD"
+
+      # Map full CRD name to upstream filename format (gateway.networking.k8s.io_<plural>.yaml)
+      # e.g., gatewayclasses.gateway.networking.k8s.io -> gateway.networking.k8s.io_gatewayclasses.yaml
+      CRD_PLURAL=$(echo "$CRD" | cut -d. -f1)
+      CRD_GROUP=$(echo "$CRD" | cut -d. -f2-)
+      UPSTREAM_FILENAME="${CRD_GROUP}_${CRD_PLURAL}.yaml"
+      DOWNLOAD_URL="https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/${GATEWAY_API_VERSION}/config/crd/${RELEASE_CHANNEL}/${UPSTREAM_FILENAME}"
+
+      if kubectl get crd "$CRD" >/dev/null 2>&1; then
+        # --- CRD Exists: Check for Upgrade ---
+        echo "CRD $CRD already exists. Checking for upgrade..."
+
+        # 1. Channel Safety Check
+        CURRENT_CHANNEL=$(kubectl get crd "$CRD" -o jsonpath='{.metadata.labels.gateway\.networking\.k8s\.io/channel}' || echo "")
+        if [ -n "$CURRENT_CHANNEL" ] && [ "$CURRENT_CHANNEL" != "$RELEASE_CHANNEL" ]; then
+           echo "WARNING: Channel mismatch for $CRD. Installed: '$CURRENT_CHANNEL', Requested: '$RELEASE_CHANNEL'. Skipping to avoid conflicts."
+           continue
+        fi
+
+        # 2. Version Check
+        # Fetch standard Gateway API version label/annotation
+        CURRENT_VERSION=$(kubectl get crd "$CRD" -o jsonpath='{.metadata.annotations.gateway\.networking\.k8s\.io/bundle-version}' || echo "")
+
+        # Fallback: try label if annotation is missing (some older versions might used labels)
+        if [ -z "$CURRENT_VERSION" ]; then
+           CURRENT_VERSION=$(kubectl get crd "$CRD" -o jsonpath='{.metadata.labels.gateway\.networking\.k8s\.io/bundle-version}' || echo "")
+        fi
+
+        if [ -z "$CURRENT_VERSION" ]; then
+           echo "WARNING: Could not determine current version of $CRD (missing bundle-version annotation/label). Skipping for safety."
+           continue
+        fi
+
+        if version_lt "$CURRENT_VERSION" "$GATEWAY_API_VERSION"; then
+           echo "Upgrading $CRD from $CURRENT_VERSION to $GATEWAY_API_VERSION..."
+           kubectl apply -f "$DOWNLOAD_URL"
+        else
+           echo "Skipping $CRD: Installed version ($CURRENT_VERSION) is equal to or newer than requested ($GATEWAY_API_VERSION)."
+        fi
+
+      else
+        # --- CRD is Missing: Install ---
+        echo "CRD $CRD not found. Installing version $GATEWAY_API_VERSION ($RELEASE_CHANNEL)..."
+        if ! kubectl apply -f "$DOWNLOAD_URL"; then
+           echo "ERROR: Failed to install $CRD from $DOWNLOAD_URL. Please check if the version/channel combination is valid."
+           exit 1
+        fi
+      fi
+    done
+
+    echo "------------------------------------------------"
+    echo "Gateway API CRD installation/upgrade process complete."
