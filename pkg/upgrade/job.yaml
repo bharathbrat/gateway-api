@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gateway-api-crd-install
+  namespace: default
+  labels:
+    app: gateway-api-crd-installer
+spec:
+  ttlSecondsAfterFinished: 600  # Clean up job 10 mins after completion
+  template:
+    metadata:
+      labels:
+        app: gateway-api-crd-installer
+    spec:
+      serviceAccountName: gateway-api-crd-installer
+      restartPolicy: OnFailure
+      containers:
+      - name: installer
+        # Use a stable kubectl image that includes basic shell tools (sh, sort, cut, tr)
+        image: registry.k8s.io/kubectl:v1.31.0
+        command: ["/bin/sh", "/scripts/install.sh"]
+        env:
+        # --- CONFIGURATION START ---
+        # Set the desired Gateway API version (must be a valid GitHub tag)
+        - name: GATEWAY_API_VERSION
+          value: "v1.2.0"
+        # Set the release channel: "standard" or "experimental"
+        - name: RELEASE_CHANNEL
+          value: "standard"
+        # Optional: Restrict to specific CRDs if you don't want the full bundle
+        # - name: CRD_SUBSET
+        #   value: "gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io"
+        # --- CONFIGURATION END ---
+        volumeMounts:
+        - name: install-script
+          mountPath: /scripts
+      volumes:
+      - name: install-script
+        configMap:
+          name: gateway-api-crd-installer-script
+          defaultMode: 0755
